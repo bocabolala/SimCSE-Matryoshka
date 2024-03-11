@@ -27,7 +27,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.optimization import get_linear_schedule_with_warmup
 from transformers.tokenization_utils import BatchEncoding, PreTrainedTokenizer
 
-from MRL import MatryoshkaConstrativeLoss, MatryoshkaLinearLayer, FixedFeatureLayer
+from MRL import MatryoshkaContrastiveLoss, MatryoshkaLinearLayer, FixedFeatureLayer
 
 from sts import STSEvaluation
 
@@ -62,6 +62,9 @@ class Args:
     # Minimal Matryoshka nesting dimension 
     minimal_dim: int = 128
 
+    # Whether to use efficient matryoshka nesting representation
+    efficient_matryoshka: bool = False
+
     # FYI: max_seq_len of reference implementation is 32
     # it seems short, but it is enough for the STS task
     # you should be careful when you apply SimCSE to other tasks that require longer sequences to be handled properly.
@@ -86,7 +89,7 @@ class Args:
     # FYI: https://github.com/princeton-nlp/SimCSE/issues/63
     seed: int = 42
 
-
+print(Args.efficient_matryoshka)
 # Reading text line by line is a very simple processing, so we don't need to use a Dataset class actually.
 # However we define a dedicated class for future extensibility.
 @dataclass
@@ -113,9 +116,9 @@ class SimCSEDataset(Dataset):
 
 
 class SimCSEModel(nn.Module):
-    def __init__(self, model_name: str):
+    def __init__(self, args: Args):
         super().__init__()
-        self.backbone: PreTrainedModel = AutoModel.from_pretrained(model_name)
+        self.backbone: PreTrainedModel = AutoModel.from_pretrained(args.model_name)
 
         self.hidden_size: int = self.backbone.config.hidden_size
         self.dense = nn.Linear(self.hidden_size, self.hidden_size)
@@ -123,11 +126,16 @@ class SimCSEModel(nn.Module):
 
         nesting_dims_list = [2 ** i for i in
                              range(int(math.log2(args.minimal_dim)), int(math.log2(self.hidden_size)) + 1)]
+        if nesting_dims_list[-1] < self.hidden_size:
+            nesting_dims_list.append(self.hidden_size)
+        self.nesting_dims_list = nesting_dims_list
+
         self.matryoshkalinear = MatryoshkaLinearLayer(
             input_dim=self.hidden_size,
             out_dim=1000,
-            nesting_dims=nesting_dims_list,
-            efficient=True)
+            nesting_dims=self.nesting_dims_list,
+            efficient=args.efficient_matryoshka
+            )
 
     def forward(
             self,
@@ -170,11 +178,9 @@ def main(args: Args):
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model: SimCSEModel = SimCSEModel(args.model_name).to(args.device)
+    model: SimCSEModel = SimCSEModel(args).to(args.device)
+    nesting_dims_list: List[int] = model.nesting_dims_list
 
-    hidden_size = model.hidden_size
-    nesting_dims_list = [2 ** i for i in range(int(math.log2(args.minimal_dim)), int(math.log2(hidden_size)) + 1)]
-    nesting_dims_list.append(hidden_size)
     print(f'Matryoshka Dimensions:{nesting_dims_list}')
 
     train_dataset = SimCSEDataset(args.dataset_dir / "train.txt")
@@ -238,7 +244,7 @@ def main(args: Args):
     # encode sentences (List[str]) and output embeddings (Tensor)
     # this is for evaluation
     @torch.inference_mode()
-    def encode(texts: List[str]) -> Dict[int, torch.Tensor]:
+    def encode(texts: List[str]) -> Dict[int, List[torch.Tensor]]:
         embs = {dim: [] for dim in nesting_dims_list}
         model.eval()
         for text in chunked(texts, args.batch_size * 8):
@@ -300,7 +306,7 @@ def main(args: Args):
             emb1 = model.forward(**batch)
             emb2 = model.forward(**batch)
 
-            criterion = MatryoshkaConstrativeLoss(temperature=args.temperature,
+            criterion = MatryoshkaContrastiveLoss(temperature=args.temperature,
                                                   device=args.device,
                                                   criterion=nn.CrossEntropyLoss)
             loss = criterion(emb1, emb2)
